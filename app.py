@@ -1,24 +1,14 @@
 import io
+import json
+import os
 import re
 from pathlib import Path
 
-import cv2
-import easyocr
-import numpy as np
 import pandas as pd
 import streamlit as st
-from pdf2image import convert_from_bytes
-from PIL import Image
-
-POPPLER_PATH = r"C:\poppler-25.12.0\Library\bin"
-
-st.set_page_config(page_title="PDF Transaction Extractor", layout="wide")
-
-
-@st.cache_resource
-def get_ocr_reader():
-    return easyocr.Reader(["en"], gpu=False)
-
+from dotenv import load_dotenv
+from google import genai
+from pypdf import PdfReader, PdfWriter
 
 reader = get_ocr_reader()
 

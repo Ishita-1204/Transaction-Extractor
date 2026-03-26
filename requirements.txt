@@ -1,10 +1,6 @@
 streamlit
 pandas
+python-dotenv
+pypdf
+google-generativeai
 openpyxl
-pdf2image
-pytesseract
-pillow
-easyocr
-numpy
-opencv-python
-PyPDF
