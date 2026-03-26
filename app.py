@@ -10,201 +10,283 @@ from dotenv import load_dotenv
 from google import genai
 from pypdf import PdfReader, PdfWriter
 
+# -----------------------------
+# CONFIG
+# -----------------------------
+load_dotenv()
 
-DATE_TIME_PATTERN = re.compile(
-    r"\b\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2}:\d{2})?\b"
-)
-AMOUNT_CR_PATTERN = re.compile(
-    r"[-+]?\d[\d,]*\.\d{2}(?:\s*Cr)?",
-    re.IGNORECASE
-)
-INTEGER_PATTERN = re.compile(r"^\d+$")
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash"
 
-def group_boxes_into_rows(boxes, y_threshold=14):
-    if not boxes:
-        return []
-
-    boxes = sorted(boxes, key=lambda b: (b["cy"], b["x1"]))
-    rows = []
-    current_row = [boxes[0]]
-    current_y = boxes[0]["cy"]
-
-    for box in boxes[1:]:
-        if abs(box["cy"] - current_y) <= y_threshold:
-            current_row.append(box)
-            current_y = (current_y + box["cy"]) / 2
-        else:
-            rows.append(sorted(current_row, key=lambda b: b["x1"]))
-            current_row = [box]
-            current_y = box["cy"]
-
-    if current_row:
-        rows.append(sorted(current_row, key=lambda b: b["x1"]))
-
-    return rows
+st.set_page_config(page_title="PDF Transaction Extractor", layout="wide")
 
 
-def is_header_or_noise_row(row_text: str) -> bool:
-    low = row_text.lower()
-    bad_words = [
-        "date",
-        "transaction description",
-        "feature reward",
-        "points",
-        "amount",
-        "amount (in rs",
-        "domestic transactions",
-        "international transactions",
-        "statement",
-        "page ",
-        "customer care",
-        "reward summary",
-        "transaction summary",
-        "payment summary",
-        "opening balance",
-        "closing balance",
-        "available credit",
-        "important",
-        "disclaimer",
-        "hdfc bank",
-        "gstin",
-        "card ending",
+# -----------------------------
+# PDF HELPERS
+# -----------------------------
+def unlock_pdf_bytes(pdf_bytes: bytes, password: str = "") -> bytes:
+    """
+    If password is provided and PDF is encrypted, decrypt it and return unlocked bytes.
+    Otherwise return original bytes.
+    """
+    input_stream = io.BytesIO(pdf_bytes)
+    reader = PdfReader(input_stream)
+
+    if reader.is_encrypted:
+        if not password:
+            raise ValueError("This PDF is password protected. Enter the password.")
+
+        decrypt_result = reader.decrypt(password)
+        if decrypt_result == 0:
+            raise ValueError("Incorrect PDF password.")
+
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+
+        output_stream = io.BytesIO()
+        writer.write(output_stream)
+        return output_stream.getvalue()
+
+    return pdf_bytes
+
+
+def extract_text_preview(pdf_bytes: bytes) -> str:
+    """
+    Optional PDF text preview for debugging.
+    """
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        chunks = []
+        for i, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            chunks.append(f"\n--- PAGE {i} ---\n{text}")
+        return "\n".join(chunks).strip()
+    except Exception:
+        return ""
+
+
+def get_total_pages(pdf_bytes: bytes, password: str = "") -> int:
+    unlocked_pdf = unlock_pdf_bytes(pdf_bytes, password)
+    reader = PdfReader(io.BytesIO(unlocked_pdf))
+    return len(reader.pages)
+
+
+# -----------------------------
+# GEMINI HELPERS
+# -----------------------------
+def get_gemini_client():
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY not found in Streamlit secrets or .env file.")
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def extract_json_block(text: str):
+    text = text.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    start_array = text.find("[")
+    end_array = text.rfind("]")
+    if start_array != -1 and end_array != -1 and end_array > start_array:
+        candidate = text[start_array:end_array + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    start_obj = text.find("{")
+    end_obj = text.rfind("}")
+    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+        candidate = text[start_obj:end_obj + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    raise ValueError("Could not parse JSON returned by Gemini.")
+
+
+def normalize_date(value):
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if value.lower() in {"nan", "none", "null", ""}:
+        return ""
+
+    patterns = [
+        r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\b",
+        r"\b\d{2}/\d{2}/\d{4}\b",
     ]
-    return any(word in low for word in bad_words)
+    for pat in patterns:
+        m = re.search(pat, value)
+        if m:
+            return m.group(0)
+    return value
 
 
-def split_boxes_by_section(images):
-    domestic_boxes = []
-    international_boxes = []
-    current_section = None
+def normalize_amount(value):
+    """
+    Preserve amount as shown:
+    - keep commas
+    - keep decimals
+    - keep Cr
+    - remove minus sign
+    - ignore plain integers like reward points
+    - support Indian number format like 1,88,800.00
+    """
+    if value is None:
+        return ""
 
-    for img in images:
-        page_boxes = extract_ocr_boxes_from_image(img)
-        page_rows = group_boxes_into_rows(page_boxes)
+    original = str(value).strip()
+    if original.lower() in {"nan", "none", "null", ""}:
+        return ""
 
-        for row in page_rows:
-            row_text = " ".join(b["text"] for b in row).strip().lower()
+    has_cr = bool(re.search(r"\bCr\b", original, flags=re.IGNORECASE))
 
-            if "domestic transactions" in row_text:
-                current_section = "domestic"
-                continue
+    cleaned = (
+        original.replace("₹", "")
+        .replace("Rs.", "")
+        .replace("Rs", "")
+        .strip()
+    )
 
-            if "international transactions" in row_text:
-                current_section = "international"
-                continue
+    cleaned_no_cr = re.sub(r"\bCr\b", "", cleaned, flags=re.IGNORECASE).strip()
 
-            if current_section == "domestic":
-                domestic_boxes.extend(row)
-            elif current_section == "international":
-                international_boxes.extend(row)
+    match = re.search(r"-?(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}", cleaned_no_cr)
+    if match:
+        amount = match.group(0).replace("-", "")
+        return f"{amount} Cr" if has_cr else amount
 
-    return domestic_boxes, international_boxes
+    return ""
 
 
-def parse_rows_from_boxes(boxes, tx_type="Domestic"):
-    rows_grouped = group_boxes_into_rows(boxes)
-    parsed_rows = []
-    pending = None
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    expected_cols = [
+        "Transaction Type",
+        "Date",
+        "Transaction Description",
+        "Amount (in Rs.)",
+    ]
 
-    for row in rows_grouped:
-        row_text = " ".join(b["text"] for b in row).strip()
+    if df.empty:
+        return pd.DataFrame(columns=expected_cols)
 
-        if not row_text or is_header_or_noise_row(row_text):
-            continue
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = ""
 
-        date_tokens = []
-        desc_tokens = []
-        reward_tokens = []
-        amount_tokens = []
+    df = df[expected_cols].copy()
 
-        for b in row:
-            x = b["cx"]
-            txt = b["text"].strip()
+    df["Transaction Type"] = df["Transaction Type"].astype(str).str.strip()
+    df["Date"] = df["Date"].apply(normalize_date)
+    df["Transaction Description"] = (
+        df["Transaction Description"]
+        .astype(str)
+        .fillna("")
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    df["Amount (in Rs.)"] = df["Amount (in Rs.)"].apply(normalize_amount)
 
-            if x < 170:
-                date_tokens.append(txt)
-            elif x < 600:
-                desc_tokens.append(txt)
-            elif x < 740:
-                reward_tokens.append(txt)
-            else:
-                amount_tokens.append(txt)
-
-        date_text = " ".join(date_tokens).strip()
-        desc_text = " ".join(desc_tokens).strip()
-        reward_text = " ".join(reward_tokens).strip()
-        amount_text = " ".join(amount_tokens).strip()
-
-        date_match = DATE_TIME_PATTERN.search(date_text)
-        date_val = date_match.group(0) if date_match else ""
-
-        amount_match = AMOUNT_CR_PATTERN.search(amount_text)
-        amount_val = amount_match.group(0) if amount_match else ""
-
-        reward_val = ""
-        for token in reward_text.split():
-            token_clean = token.replace(",", "").strip()
-            if INTEGER_PATTERN.fullmatch(token_clean):
-                reward_val = token_clean
-                break
-
-        if date_val and amount_val:
-            if pending:
-                parsed_rows.append(pending)
-
-            pending = {
-                "Transaction Type": tx_type,
-                "Date": date_val,
-                "Transaction Description": desc_text.strip(),
-                "Feature Reward Points": reward_val,
-                "Amount (in Rs.)": amount_val.strip(),
-            }
-        else:
-            if pending and desc_text:
-                pending["Transaction Description"] = (
-                    pending["Transaction Description"] + " " + desc_text
-                ).strip()
-
-        # if row has reward only and no desc, attach reward to pending if empty
-        if pending and reward_val and not pending.get("Feature Reward Points"):
-            pending["Feature Reward Points"] = reward_val
-
-    if pending:
-        parsed_rows.append(pending)
-
-    df = pd.DataFrame(parsed_rows)
-
-    if not df.empty:
-        df["Transaction Description"] = (
-            df["Transaction Description"]
-            .astype(str)
-            .str.replace(r"\s+", " ", regex=True)
-            .str.strip()
+    df = df[
+        ~(
+            (df["Date"] == "")
+            & (df["Transaction Description"] == "")
+            & (df["Amount (in Rs.)"] == "")
         )
-        df["Feature Reward Points"] = (
-            df["Feature Reward Points"].astype(str).replace("nan", "").str.strip()
-        )
-        df["Amount (in Rs.)"] = (
-            df["Amount (in Rs.)"]
-            .astype(str)
-            .str.replace(r"\s+", " ", regex=True)
-            .str.strip()
-        )
+    ].reset_index(drop=True)
 
     return df
 
 
-def normalize_amount_column(df: pd.DataFrame):
-    if "Amount (in Rs.)" in df.columns:
-        df["Amount (in Rs.)"] = (
-            df["Amount (in Rs.)"]
-            .astype(str)
-            .str.replace(r"\s+", " ", regex=True)
-            .str.strip()
-        )
-    return df
+def parse_with_gemini(pdf_bytes: bytes):
+    client = get_gemini_client()
+
+    prompt = """
+You are extracting transactions from the ENTIRE credit-card statement PDF.
+
+Return ONLY valid JSON with this exact schema:
+{
+  "domestic": [
+    {
+      "Transaction Type": "Domestic",
+      "Date": "",
+      "Transaction Description": "",
+      "Amount (in Rs.)": ""
+    }
+  ],
+  "international": [
+    {
+      "Transaction Type": "International",
+      "Date": "",
+      "Transaction Description": "",
+      "Amount (in Rs.)": ""
+    }
+  ]
+}
+
+Rules:
+1. Read the ENTIRE PDF, all pages.
+2. Extract rows from Domestic and International sections separately across all pages.
+3. Extract only:
+   - Transaction Type
+   - Date
+   - Transaction Description
+   - Amount (in Rs.)
+4. Preserve amount exactly as shown in the statement.
+5. Preserve commas, decimals, and Cr.
+6. Handle Indian comma format exactly, such as 1,88,800.00.
+7. Never change 28,500.00 to 28,000.00.
+8. Never use reward points as amount.
+9. Ignore headers, summaries, totals, reward points, footers, and page labels.
+10. If a row spans multiple lines, merge description into one row.
+11. If the same transaction continues on later pages, keep proper row continuity.
+12. Do not invent rows.
+13. If a number is unclear, prefer the visually exact rightmost amount in the row.
+
+Return JSON only.
+"""
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            prompt,
+            {
+                "inline_data": {
+                    "mime_type": "application/pdf",
+                    "data": pdf_bytes,
+                }
+            },
+        ],
+    )
+
+    raw_text = response.text
+    parsed = extract_json_block(raw_text)
+
+    domestic = parsed.get("domestic", []) if isinstance(parsed, dict) else []
+    international = parsed.get("international", []) if isinstance(parsed, dict) else []
+
+    domestic_df = clean_dataframe(pd.DataFrame(domestic))
+    international_df = clean_dataframe(pd.DataFrame(international))
+
+    if not domestic_df.empty:
+        domestic_df["Transaction Type"] = "Domestic"
+    if not international_df.empty:
+        international_df["Transaction Type"] = "International"
+
+    combined_df = pd.concat([domestic_df, international_df], ignore_index=True)
+    combined_df = clean_dataframe(combined_df)
+
+    return domestic_df, international_df, combined_df, raw_text
 
 
+# -----------------------------
+# FILE HELPERS
+# -----------------------------
 def read_existing_uploaded_file(uploaded_file):
     ext = Path(uploaded_file.name).suffix.lower()
 
@@ -221,40 +303,31 @@ def read_existing_uploaded_file(uploaded_file):
 
 
 def combine_and_deduplicate(old_df: pd.DataFrame, new_df: pd.DataFrame):
-    if old_df is None or old_df.empty:
+    old_df = clean_dataframe(old_df) if old_df is not None and not old_df.empty else pd.DataFrame()
+    new_df = clean_dataframe(new_df) if new_df is not None and not new_df.empty else pd.DataFrame()
+
+    if old_df.empty:
         combined = new_df.copy()
     else:
         combined = pd.concat([old_df, new_df], ignore_index=True)
 
     dedup_cols = [
-        c
-        for c in [
-            "Transaction Type",
-            "Date",
-            "Transaction Description",
-            "Feature Reward Points",
-            "Amount (in Rs.)",
-        ]
-        if c in combined.columns
+        "Transaction Type",
+        "Date",
+        "Transaction Description",
+        "Amount (in Rs.)",
     ]
 
-    if dedup_cols:
-        combined = combined.drop_duplicates(subset=dedup_cols, keep="last")
-
-    combined = combined.reset_index(drop=True)
+    combined = combined.drop_duplicates(subset=dedup_cols, keep="last").reset_index(drop=True)
     return combined
 
 
-def build_excel_bytes(
-    combined_df: pd.DataFrame, domestic_df: pd.DataFrame, international_df: pd.DataFrame
-):
+def build_excel_bytes(combined_df: pd.DataFrame, domestic_df: pd.DataFrame, international_df: pd.DataFrame):
     output = io.BytesIO()
-
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         combined_df.to_excel(writer, index=False, sheet_name="Combined")
         domestic_df.to_excel(writer, index=False, sheet_name="Domestic")
         international_df.to_excel(writer, index=False, sheet_name="International")
-
     output.seek(0)
     return output.getvalue()
 
@@ -263,85 +336,79 @@ def build_csv_bytes(df: pd.DataFrame):
     return df.to_csv(index=False).encode("utf-8")
 
 
-def extract_transactions_from_pdf(pdf_bytes: bytes):
-    images = pdf_to_images(pdf_bytes)
-
+# -----------------------------
+# PIPELINE
+# -----------------------------
+def run_pipeline(pdf_bytes: bytes, pdf_password: str = ""):
     progress_bar = st.progress(0)
     log_box = st.empty()
 
-    total_pages = len(images)
-    page_texts = []
+    log_box.markdown("**🔓 Opening PDF...**")
+    unlocked_pdf = unlock_pdf_bytes(pdf_bytes, pdf_password)
+    total_pages = get_total_pages(pdf_bytes, pdf_password)
+    progress_bar.progress(35)
 
-    for i, img in enumerate(images, start=1):
-        log_box.markdown(f"**📄 OCR page {i}/{total_pages}...**")
-        page_boxes = extract_ocr_boxes_from_image(img)
-        preview_text = " ".join(
-            [b["text"] for b in sorted(page_boxes, key=lambda x: (x["cy"], x["x1"]))]
-        )
-        page_texts.append((i, preview_text[:30000]))
-        progress_bar.progress(i / total_pages)
+    log_box.markdown(f"**📄 Reading full PDF preview text ({total_pages} pages)...**")
+    preview_text = extract_text_preview(unlocked_pdf)
+    progress_bar.progress(65)
 
-    log_box.markdown("**🔍 Splitting Domestic and International sections...**")
-    domestic_boxes, international_boxes = split_boxes_by_section(images)
-
-    log_box.markdown("**📊 Parsing Domestic transactions...**")
-    domestic_df = parse_rows_from_boxes(domestic_boxes, tx_type="Domestic")
-    domestic_df = normalize_amount_column(domestic_df)
-
-    log_box.markdown("**🌍 Parsing International transactions...**")
-    international_df = parse_rows_from_boxes(international_boxes, tx_type="International")
-    international_df = normalize_amount_column(international_df)
-
-    if not domestic_df.empty or not international_df.empty:
-        combined_df = pd.concat([domestic_df, international_df], ignore_index=True)
-    else:
-        combined_df = pd.DataFrame(
-            columns=[
-                "Transaction Type",
-                "Date",
-                "Transaction Description",
-                "Feature Reward Points",
-                "Amount (in Rs.)",
-            ]
-        )
+    log_box.markdown("**🤖 Processing full PDF with Gemini...**")
+    domestic_df, international_df, combined_df, raw_model_output = parse_with_gemini(
+        unlocked_pdf
+    )
+    progress_bar.progress(100)
 
     log_box.markdown("**✅ Extraction completed!**")
-    return domestic_df, international_df, combined_df, page_texts
+    return domestic_df, international_df, combined_df, preview_text, raw_model_output, total_pages
 
 
+# -----------------------------
+# UI
+# -----------------------------
 st.title("PDF Domestic / International Transaction Extractor")
-st.write(
-    "Upload a PDF statement, extract the transactions table, preview it, and save it as a new CSV/Excel or append it to an existing file."
-)
 
-with st.expander("Important setup note for Windows"):
-    st.write("Run using:")
+if not GEMINI_API_KEY:
+    st.error("GEMINI_API_KEY not found in Streamlit secrets or .env file")
+    st.stop()
+
+with st.expander("Setup"):
+    st.write("Run locally with:")
     st.code("python -m streamlit run app.py", language="bash")
-    st.write("Poppler path used in code:")
-    st.code(POPPLER_PATH)
+    st.write("Gemini model used in code:")
+    st.code(GEMINI_MODEL)
 
+pdf_password = st.text_input("PDF Password (optional)", type="password")
 uploaded_pdf = st.file_uploader("Upload PDF statement", type=["pdf"])
 
 if uploaded_pdf is not None:
     pdf_bytes = uploaded_pdf.read()
 
-    with st.spinner("Starting extraction..."):
-        try:
-            domestic_df, international_df, combined_df, page_texts = extract_transactions_from_pdf(
-                pdf_bytes
-            )
-        except Exception as e:
-            st.error(f"Extraction failed: {e}")
-            st.stop()
+    try:
+        total_pages = get_total_pages(pdf_bytes, pdf_password)
+    except Exception as e:
+        st.error(f"Could not open PDF: {e}")
+        st.stop()
 
-    st.success("Extraction completed.")
+    try:
+        domestic_df, international_df, combined_df, preview_text, raw_model_output, total_pages = run_pipeline(
+            pdf_bytes,
+            pdf_password,
+        )
+    except Exception as e:
+        st.error(f"Extraction failed: {e}")
+        st.stop()
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Domestic rows", len(domestic_df))
-    col2.metric("International rows", len(international_df))
-    col3.metric("Combined rows", len(combined_df))
+    st.success("Done.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Domestic", "International", "Combined", "Raw OCR"])
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total pages", int(total_pages))
+    col2.metric("Domestic rows", len(domestic_df))
+    col3.metric("International rows", len(international_df))
+    col4.metric("Combined rows", len(combined_df))
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Domestic", "International", "Combined", "PDF Text Preview", "Raw Gemini Output"]
+    )
 
     with tab1:
         if domestic_df.empty:
@@ -362,9 +429,13 @@ if uploaded_pdf is not None:
             st.dataframe(combined_df, use_container_width=True)
 
     with tab4:
-        for page_no, text in page_texts:
-            with st.expander(f"Page {page_no} OCR text"):
-                st.text(text)
+        if preview_text.strip():
+            st.text(preview_text[:30000])
+        else:
+            st.info("No text preview available.")
+
+    with tab5:
+        st.text(raw_model_output[:30000])
 
     st.markdown("---")
     st.subheader("Save / Append Output")
@@ -394,9 +465,7 @@ if uploaded_pdf is not None:
             try:
                 old_df = read_existing_uploaded_file(existing_file)
                 final_df = combine_and_deduplicate(old_df, combined_df)
-                st.info(
-                    f"Existing rows: {len(old_df)} | Final rows after append/deduplicate: {len(final_df)}"
-                )
+                st.info(f"Existing rows: {len(old_df)} | Final rows after append/deduplicate: {len(final_df)}")
                 st.dataframe(final_df, use_container_width=True)
             except Exception as e:
                 st.error(f"Could not read existing file: {e}")
@@ -404,11 +473,7 @@ if uploaded_pdf is not None:
         else:
             st.warning("Upload an existing CSV/Excel file to append.")
 
-    output_name = st.text_input(
-        "Output file name (without extension)",
-        value="transactions_output",
-    ).strip()
-
+    output_name = st.text_input("Output file name (without extension)", value="transactions_output").strip()
     if output_name == "":
         output_name = "transactions_output"
 
