@@ -2,5 +2,5 @@ streamlit
 pandas
 python-dotenv
 pypdf
-google-generativeai
+google-genai
 openpyxl
