@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 from google import genai
 from pypdf import PdfReader, PdfWriter
 
-reader = get_ocr_reader()
 
 DATE_TIME_PATTERN = re.compile(
     r"\b\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2}:\d{2})?\b"
@@ -20,57 +19,6 @@ AMOUNT_CR_PATTERN = re.compile(
     re.IGNORECASE
 )
 INTEGER_PATTERN = re.compile(r"^\d+$")
-
-
-def preprocess_image(pil_img: Image.Image) -> np.ndarray:
-    img = np.array(pil_img)
-
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = img
-
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return gray
-
-
-def pdf_to_images(pdf_bytes: bytes):
-    return convert_from_bytes(pdf_bytes, dpi=200, poppler_path=POPPLER_PATH)
-
-
-def extract_ocr_boxes_from_image(pil_img: Image.Image):
-    processed = preprocess_image(pil_img)
-    results = reader.readtext(processed, detail=1, paragraph=False)
-
-    boxes = []
-    for item in results:
-        try:
-            bbox, text, conf = item
-            if conf < 0.35:
-                continue
-
-            x1 = min(pt[0] for pt in bbox)
-            y1 = min(pt[1] for pt in bbox)
-            x2 = max(pt[0] for pt in bbox)
-            y2 = max(pt[1] for pt in bbox)
-
-            boxes.append(
-                {
-                    "text": str(text).strip(),
-                    "x1": float(x1),
-                    "y1": float(y1),
-                    "x2": float(x2),
-                    "y2": float(y2),
-                    "cx": float((x1 + x2) / 2),
-                    "cy": float((y1 + y2) / 2),
-                }
-            )
-        except Exception:
-            continue
-
-    return boxes
-
 
 def group_boxes_into_rows(boxes, y_threshold=14):
     if not boxes:
